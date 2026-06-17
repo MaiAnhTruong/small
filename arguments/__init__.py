@@ -102,14 +102,18 @@ class OptimizationParams(ParamGroup):
         #   none    : no depth supervision (= vanilla 3DGS, ablation baseline (i))
         #   uniform : original 3DGS depth loss, depth_mask=ones (ablation (ii), ~FSGS/global depth)
         #   covonly : g_cov(cov) only (ablation (iii), ~CoMapGS covisibility gate)
-        #   gated   : g_cov(cov)*rel (ours, (iv)) -- MSE-optimal allocation (proven, test_vsdepth_theory.py)
+        #   gated   : g_cov(cov)*rel (ours v1, (iv)) -- MSE-optimal allocation (proven, test_vsdepth_theory.py)
+        #   fisher  : weight = a*(H,delta), H = photometric FISHER info (v2, proven test_fisher_gate.py 8/8).
+        #             Fixes CoMapGS limitation: count drops texture |grad I|^2 + geometry -> wrong proxy of H.
         self.gate_mode = "uniform"
         self.cov_start = 2000          # begin gating after geometry roughly forms (depth meaningful)
         self.cov_interval = 1000       # recompute covisibility/gate every N iters (renders all train depths)
         self.cov_tau = 0.05            # depth tolerance for the occlusion check
-        self.cov_max_dim = 200         # covisibility computed at this max image dim (smooth -> downsampled)
+        self.cov_max_dim = 200         # covisibility/Fisher computed at this max image dim (smooth -> downsampled)
         self.gate_gamma = 1.0          # g_cov = 1/(1+cov)^gamma : sharpness of covisibility down-weighting
         self.gate_rel_sigma = 0.10     # reliability = exp(-|grad(mono_invdepth)|/sigma) : edge down-weight
+        self.fisher_c = 0.5            # fisher: a* threshold c (mean-normalized H,delta); higher -> more max-weight
+        self.fisher_cap = 8.0          # fisher: max per-pixel depth weight (clamp on a*)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

@@ -14,7 +14,7 @@ import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
-from utils.covisibility import compute_gates
+from utils.covisibility import compute_gates, compute_fisher_gates, image_grad_mag
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
@@ -53,9 +53,18 @@ def recompute_vsdepth_gates(scene, gaussians, pipe, background, opt, separate_sh
         depths_z.append(1.0 / invd.clamp_min(1e-6))             # -> metric depth z for covisibility
         invds.append(c.invdepthmap[0] if c.invdepthmap is not None else None)
         masks.append(c.depth_mask[0] if getattr(c, "depth_mask", None) is not None else torch.ones_like(invd))
-    gates = compute_gates(cams, depths_z, invds, masks, opt.gate_mode,
-                          tau=opt.cov_tau, gamma=opt.gate_gamma, rel_sigma=opt.gate_rel_sigma,
-                          max_dim=opt.cov_max_dim)
+    if opt.gate_mode == "fisher":
+        grads = []
+        for c in cams:
+            if not hasattr(c, "_vsd_grad"):                     # |grad I| cached (image is fixed)
+                c._vsd_grad = image_grad_mag(c.original_image.cuda())
+            grads.append(c._vsd_grad)
+        gates = compute_fisher_gates(cams, depths_z, grads, invds, masks,
+                                     c=opt.fisher_c, tau=opt.cov_tau, max_dim=opt.cov_max_dim, cap=opt.fisher_cap)
+    else:
+        gates = compute_gates(cams, depths_z, invds, masks, opt.gate_mode,
+                              tau=opt.cov_tau, gamma=opt.gate_gamma, rel_sigma=opt.gate_rel_sigma,
+                              max_dim=opt.cov_max_dim)
     for c, g in zip(cams, gates):
         c.vsdepth_gate = g.detach()[None]                       # [1,H,W]
 
@@ -114,8 +123,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # VS-Depth: (re)compute covisibility gates from current geometry, periodically
-        if opt.gate_mode in ("covonly", "gated") and iteration >= opt.cov_start and \
+        # VS-Depth: (re)compute covisibility/Fisher gates from current geometry, periodically
+        if opt.gate_mode in ("covonly", "gated", "fisher") and iteration >= opt.cov_start and \
            (iteration == opt.cov_start or iteration % opt.cov_interval == 0):
             recompute_vsdepth_gates(scene, gaussians, pipe, background, opt,
                                     SPARSE_ADAM_AVAILABLE, dataset.train_test_exp)
@@ -156,8 +165,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if opt.gate_mode != "none" and depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
             invDepth = render_pkg["depth"]
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-            # covonly/gated: use the covisibility gate once computed; else (uniform / pre-cov_start) depth_mask
-            if opt.gate_mode in ("covonly", "gated") and getattr(viewpoint_cam, "vsdepth_gate", None) is not None:
+            # covonly/gated/fisher: use the gate once computed; else (uniform / pre-cov_start) depth_mask
+            if opt.gate_mode in ("covonly", "gated", "fisher") and getattr(viewpoint_cam, "vsdepth_gate", None) is not None:
                 depth_w = viewpoint_cam.vsdepth_gate.cuda()
             else:
                 depth_w = viewpoint_cam.depth_mask.cuda()

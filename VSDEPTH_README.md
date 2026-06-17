@@ -20,7 +20,16 @@ seed-variance) and back off where mono-depth is unreliable (depth edges).
 | `none` | — (no depth) | vanilla 3DGS, ablation (i) |
 | `uniform` | `depth_mask` (ones) | original 3DGS depth-reg, ablation (ii) ≈ FSGS/global depth |
 | `covonly` | `g_cov(cov)` | ablation (iii) ≈ CoMapGS covisibility gate |
-| `gated` | `g_cov(cov)·rel` | **ours** (iv) |
+| `gated` | `g_cov(cov)·rel` | ours v1 (iv) |
+| `fisher` | `a*(H,δ)`, `H=Σ vis·(bf/z²)²·\|∇I\|²` | **ours v2** — photometric Fisher info (see `DESIGN_AND_PROOF_v2.md`) |
+
+**v2 (FIG-Depth):** the curvature `H` in the theory = photometric Fisher info = MVS triangulation info, NOT
+raw view count. CoMapGS's count drops texture `|∇I|²` + geometry `(bf/z²)²` → wrong proxy of `H`; it is blind
+to "textureless-but-covisible" regions (low H = under-constrained, but count high → CoMapGS under-supervises).
+`--gate_mode fisher` sets the depth weight to the MSE-optimal `a*(H,δ)`. Proven: `tools/test_fisher_gate.py`
+(8/8, −31% MSE vs count = 22% optimal-form + 11% texture/geom signal), `tools/test_fisher_code.py` (8/8).
+Real-data check `tools/fisher_realdata_check.py`: on mip360 sparse-12, Spearman(count,H)=0.44 (≠1) and **21.7%**
+of points are the CoMapGS blind spot (room 19%, counter 21%, bicycle 33%; garden 2% = texture-rich, fisher≈cov).
 
 `g_cov = 1/(1+cov)^gamma` (decreasing in covisibility); `rel = exp(−|∇ mono_invdepth|/sigma)`; gate mean-pinned
 to 1 (same depth budget as uniform). At `gate_mode=uniform`/`none` the code is bit-identical to base.
