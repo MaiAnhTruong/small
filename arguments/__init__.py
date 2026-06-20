@@ -117,8 +117,10 @@ class OptimizationParams(ParamGroup):
         # ---- VS-Depth v4: FRGD (Fisher-Reliability-Guided Densification) ----
         # densify depth into PLACEMENT (non-zero-sum) instead of LOSS (zero-sum, measured dead). Seeds new
         # Gaussians at multi-view-refined depth in under-reconstructed + low-texture + reliable regions.
-        # densify_mode=none -> base 3DGS densification only (bit-identical baseline). frgd -> + FRGD.
-        # Typically run WITH gate_mode=uniform (-d depths): uniform depth loss (proven) + FRGD densification.
+        # densify_mode: none -> base 3DGS densify only (bit-identical baseline); frgd -> + FRGD (refined depth
+        # + reliability + texture targeting); rawdensify -> ABLATION (naive raw-mono densify, no refine/gate)
+        # to isolate whether the refinement+targeting (novelty) matters vs plain depth densification.
+        # Typically run WITH gate_mode=uniform (-d depths): uniform depth loss (proven) + densification.
         self.densify_mode = "none"
         self.frgd_start = 2000         # begin FRGD after geometry roughly forms
         self.frgd_interval = 1000      # run FRGD every N iters (renders all train depths + refine)

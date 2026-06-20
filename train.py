@@ -102,24 +102,29 @@ def frgd_step(scene, gaussians, pipe, background, opt, separate_sh, use_exp, ite
         masks.append(c.depth_mask[0] if getattr(c, "depth_mask", None) is not None else torch.ones_like(inv_r))
     if not any_depth:
         return
-    D_ref, REL = refine_depth_maps(cams, mono_z, tau=opt.cov_tau, max_dim=opt.cov_max_dim)
+    mode = opt.densify_mode
+    if mode == "rawdensify":          # ABLATION: naive raw-mono densify (NO refine, NO reliability/texture gate)
+        place = mono_z; REL = [torch.ones_like(m) for m in mono_z]; tex_thr = 1e9
+    else:                             # frgd (ours): multi-view-REFINED depth + reliability + texture targeting
+        place, REL = refine_depth_maps(cams, mono_z, tau=opt.cov_tau, max_dim=opt.cov_max_dim)
+        tex_thr = opt.frgd_tex_thr
     Xs, Cs = [], []
     for i in range(len(cams)):
-        hole = ((render_z[i] - D_ref[i]) / D_ref[i].clamp_min(1e-6)).clamp(0.0, 10.0)   # render behind prior surface
-        xyz, rgb = generate_frgd_points(cams[i], imgs[i], D_ref[i], REL[i], grads[i], hole, base_mask=masks[i],
-                                        tex_thr=opt.frgd_tex_thr, hole_thr=opt.frgd_hole_thr,
+        hole = ((render_z[i] - place[i]) / place[i].clamp_min(1e-6)).clamp(0.0, 10.0)   # render behind prior surface
+        xyz, rgb = generate_frgd_points(cams[i], imgs[i], place[i], REL[i], grads[i], hole, base_mask=masks[i],
+                                        tex_thr=tex_thr, hole_thr=opt.frgd_hole_thr,
                                         rel_thr=opt.frgd_rel_thr, max_points=opt.frgd_max_per_step)
         if xyz.shape[0] > 0:
             Xs.append(xyz); Cs.append(rgb)
     if not Xs:
-        print(f"[FRGD {iteration}] 0 candidates", flush=True); return
+        print(f"[{mode} {iteration}] 0 candidates", flush=True); return
     X = torch.cat(Xs, 0).cuda(); C = torch.cat(Cs, 0).cuda()
     keep = _frgd_dedup(X, gaussians.get_xyz, opt.percent_dense * scene.cameras_extent)
     X, C = X[keep], C[keep]
     if X.shape[0] > opt.frgd_max_per_step:
         idx = torch.randperm(X.shape[0], device=X.device)[:opt.frgd_max_per_step]; X, C = X[idx], C[idx]
     n = gaussians.add_frgd_points(X, C)
-    print(f"[FRGD {iteration}] +{n} pts -> {gaussians.get_xyz.shape[0]} total", flush=True)
+    print(f"[{mode} {iteration}] +{n} pts -> {gaussians.get_xyz.shape[0]} total", flush=True)
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
@@ -265,8 +270,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
-                # VS-Depth v4 FRGD: depth-guided densification of under-reconstructed low-texture regions
-                if opt.densify_mode == "frgd" and iteration >= opt.frgd_start and iteration % opt.frgd_interval == 0:
+                # VS-Depth v4 FRGD: depth-guided densification (frgd=refined+targeted; rawdensify=naive ablation)
+                if opt.densify_mode in ("frgd", "rawdensify") and iteration >= opt.frgd_start and iteration % opt.frgd_interval == 0:
                     frgd_step(scene, gaussians, pipe, background, opt, SPARSE_ADAM_AVAILABLE,
                               dataset.train_test_exp, iteration)
 
