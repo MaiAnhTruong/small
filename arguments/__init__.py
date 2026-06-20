@@ -119,7 +119,8 @@ class OptimizationParams(ParamGroup):
         # Gaussians at multi-view-refined depth in under-reconstructed + low-texture + reliable regions.
         # densify_mode: none -> base 3DGS densify only (bit-identical baseline); frgd -> + FRGD (refined depth
         # + reliability + texture targeting); rawdensify -> ABLATION (naive raw-mono densify, no refine/gate)
-        # to isolate whether the refinement+targeting (novelty) matters vs plain depth densification.
+        # to isolate whether the refinement+targeting (novelty) matters vs plain depth densification;
+        # bdvr -> FRGD add + BDVR suppression (v5): the newest method = bidirectional add(holes)+remove(floaters).
         # Typically run WITH gate_mode=uniform (-d depths): uniform depth loss (proven) + densification.
         self.densify_mode = "none"
         self.frgd_start = 2000         # begin FRGD after geometry roughly forms
@@ -128,6 +129,16 @@ class OptimizationParams(ParamGroup):
         self.frgd_tex_thr = 0.02       # low-texture: |grad I| below this (where 3DGS densify fails)
         self.frgd_hole_thr = 0.15      # under-recon: (render_z - D_ref)/D_ref above this = hole behind prior surface
         self.frgd_rel_thr = 0.5        # reliability: multi-view agreement of D_ref above this = trust placement
+        # ---- VS-Depth v5: BDVR suppression (persistent geometric opacity prior on floaters) ----
+        # Active only when densify_mode == "bdvr". L_supp = supp_lambda * sum_i phi_i * opacity_i, phi from
+        # utils/bdvr.py = (1-GS)*OCC unsupportedness. Removes multi-view-inconsistent floaters that 3DGS's own
+        # opacity-prune keeps; reversible (photometric pull restores false positives). See DESIGN_AND_PROOF_v5.
+        self.supp_lambda = 0.01        # weight of the suppression prior (per-flagged-point opacity force)
+        self.supp_start = 2000         # begin suppression after geometry forms (same as FRGD)
+        self.supp_interval = 500       # recompute phi every N iters (renders all train depths)
+        self.supp_tau = 0.05           # front-violation tolerance: in front of consensus by > tau -> floater vote
+        self.supp_rs_scale = 4.0       # anchor shell radius r_s = supp_rs_scale * percent_dense * extent
+        self.supp_min_views = 2        # need >= this many in-frame views to judge OCC (else phi=0)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

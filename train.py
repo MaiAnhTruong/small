@@ -16,6 +16,7 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 from utils.covisibility import compute_gates, compute_fisher_gates, image_grad_mag
 from utils.frgd import refine_depth_maps, generate_frgd_points
+from utils.bdvr import compute_supp_weight
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
@@ -127,6 +128,25 @@ def frgd_step(scene, gaussians, pipe, background, opt, separate_sh, use_exp, ite
     print(f"[{mode} {iteration}] +{n} pts -> {gaussians.get_xyz.shape[0]} total", flush=True)
 
 
+@torch.no_grad()
+def recompute_supp_weight(scene, gaussians, pipe, background, opt, separate_sh, use_exp, anchors):
+    """BDVR (v5): render all train depths, compute per-Gaussian unsupportedness phi (utils.bdvr) and store it
+    as gaussians.supp_weight, used by the persistent suppression prior L_supp = supp_lambda*sum(phi*opacity).
+    phi rides through densify (new points=0=grace) / prune (masked) until the next recompute."""
+    cams = scene.getTrainCameras()
+    depths_z = []
+    for c in cams:
+        pkg = render(c, gaussians, pipe, background, use_trained_exp=use_exp, separate_sh=separate_sh)
+        depths_z.append(1.0 / pkg["depth"][0].clamp_min(1e-6))                  # rendered metric depth z
+    r_s = opt.supp_rs_scale * opt.percent_dense * scene.cameras_extent
+    phi = compute_supp_weight(gaussians.get_xyz.detach(), cams, depths_z, anchors,
+                              tau=opt.supp_tau, r_s=r_s, min_views=opt.supp_min_views)
+    gaussians.supp_weight = phi
+    n_fl = int((phi > 0.5).sum().item())
+    print(f"[bdvr-supp {len(cams)}v] flagged(phi>0.5)={n_fl}/{phi.shape[0]} "
+          f"mean_phi={float(phi.mean()):.4f} r_s={r_s:.3f}", flush=True)
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -140,6 +160,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    # BDVR: snapshot the initial (SfM) Gaussian positions as fixed reliable surface anchors for suppression.
+    bdvr_anchors = gaussians.get_xyz.detach().clone() if opt.densify_mode == "bdvr" else None
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -236,7 +259,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
-        loss.backward()
+        # BDVR (v5) suppression prior: persistent geometric opacity prior on unsupported Gaussians (floaters).
+        # Added to the objective for backward only (kept OUT of the displayed ema loss). Per-flagged-point it
+        # applies a constant downward force on opacity that competes with the photometric pull (-> floaters
+        # pruned, genuine points restored). supp_weight is 0 before the first recompute / for grace points.
+        total_loss = loss
+        if opt.densify_mode == "bdvr" and iteration >= opt.supp_start \
+           and gaussians.supp_weight.shape[0] == gaussians.get_xyz.shape[0]:
+            total_loss = loss + opt.supp_lambda * (gaussians.supp_weight * gaussians.get_opacity.squeeze(1)).sum()
+
+        total_loss.backward()
 
         iter_end.record()
 
@@ -270,10 +302,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
-                # VS-Depth v4 FRGD: depth-guided densification (frgd=refined+targeted; rawdensify=naive ablation)
-                if opt.densify_mode in ("frgd", "rawdensify") and iteration >= opt.frgd_start and iteration % opt.frgd_interval == 0:
+                # VS-Depth v4 FRGD: depth-guided densification (frgd=refined+targeted; rawdensify=naive ablation;
+                # bdvr=refined add, same as frgd). The ADD side of BDVR.
+                if opt.densify_mode in ("frgd", "rawdensify", "bdvr") and iteration >= opt.frgd_start and iteration % opt.frgd_interval == 0:
                     frgd_step(scene, gaussians, pipe, background, opt, SPARSE_ADAM_AVAILABLE,
                               dataset.train_test_exp, iteration)
+
+                # VS-Depth v5 BDVR: recompute per-Gaussian unsupportedness phi (the REMOVE side). Renders all
+                # train depths; sets gaussians.supp_weight used by L_supp above.
+                if opt.densify_mode == "bdvr" and iteration >= opt.supp_start and \
+                   (iteration == opt.supp_start or iteration % opt.supp_interval == 0):
+                    recompute_supp_weight(scene, gaussians, pipe, background, opt, SPARSE_ADAM_AVAILABLE,
+                                          dataset.train_test_exp, bdvr_anchors)
 
             # Optimizer step
             if iteration < opt.iterations:
