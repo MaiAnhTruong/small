@@ -114,6 +114,18 @@ class OptimizationParams(ParamGroup):
         self.gate_rel_sigma = 0.10     # reliability = exp(-|grad(mono_invdepth)|/sigma) : edge down-weight
         self.fisher_c = 0.5            # fisher: a* threshold c (mean-normalized H,delta); higher -> more max-weight
         self.fisher_cap = 8.0          # fisher: max per-pixel depth weight (clamp on a*)
+        # ---- VS-Depth v4: FRGD (Fisher-Reliability-Guided Densification) ----
+        # densify depth into PLACEMENT (non-zero-sum) instead of LOSS (zero-sum, measured dead). Seeds new
+        # Gaussians at multi-view-refined depth in under-reconstructed + low-texture + reliable regions.
+        # densify_mode=none -> base 3DGS densification only (bit-identical baseline). frgd -> + FRGD.
+        # Typically run WITH gate_mode=uniform (-d depths): uniform depth loss (proven) + FRGD densification.
+        self.densify_mode = "none"
+        self.frgd_start = 2000         # begin FRGD after geometry roughly forms
+        self.frgd_interval = 1000      # run FRGD every N iters (renders all train depths + refine)
+        self.frgd_max_per_step = 30000 # cap new points per FRGD step (after dedup)
+        self.frgd_tex_thr = 0.02       # low-texture: |grad I| below this (where 3DGS densify fails)
+        self.frgd_hole_thr = 0.15      # under-recon: (render_z - D_ref)/D_ref above this = hole behind prior surface
+        self.frgd_rel_thr = 0.5        # reliability: multi-view agreement of D_ref above this = trust placement
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

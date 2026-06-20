@@ -15,6 +15,7 @@ from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 from utils.covisibility import compute_gates, compute_fisher_gates, image_grad_mag
+from utils.frgd import refine_depth_maps, generate_frgd_points
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
@@ -67,6 +68,58 @@ def recompute_vsdepth_gates(scene, gaussians, pipe, background, opt, separate_sh
                               max_dim=opt.cov_max_dim)
     for c, g in zip(cams, gates):
         c.vsdepth_gate = g.detach()[None]                       # [1,H,W]
+
+
+def _frgd_dedup(X, existing, voxel):
+    """Drop new points whose voxel already contains an existing Gaussian (avoid redundant overlap)."""
+    if voxel <= 0 or X.shape[0] == 0:
+        return torch.ones(X.shape[0], dtype=torch.bool, device=X.device)
+    def key(P):
+        q = torch.floor(P / voxel).long()
+        return (q[:, 0] * 73856093) ^ (q[:, 1] * 19349663) ^ (q[:, 2] * 83492791)
+    exk = key(existing).unique()
+    return ~torch.isin(key(X), exk)
+
+
+@torch.no_grad()
+def frgd_step(scene, gaussians, pipe, background, opt, separate_sh, use_exp, iteration):
+    """VS-Depth v4 FRGD: render all train depths, refine mono-depth across views (D_ref), then SEED new
+    Gaussians at D_ref in under-reconstructed (render farther than D_ref) + low-texture + reliable regions."""
+    cams = scene.getTrainCameras()
+    mono_z, imgs, grads, masks, render_z = [], [], [], [], []
+    any_depth = False
+    for c in cams:
+        pkg = render(c, gaussians, pipe, background, use_trained_exp=use_exp, separate_sh=separate_sh)
+        inv_r = pkg["depth"][0].clamp_min(1e-6)                              # rendered inverse depth
+        render_z.append(1.0 / inv_r)
+        if c.invdepthmap is not None and c.depth_reliable:
+            mono_z.append(1.0 / c.invdepthmap[0].clamp_min(1e-6)); any_depth = True
+        else:
+            mono_z.append(1.0 / inv_r)
+        if not hasattr(c, "_vsd_grad"):
+            c._vsd_grad = image_grad_mag(c.original_image.cuda())
+        grads.append(c._vsd_grad); imgs.append(c.original_image.cuda())
+        masks.append(c.depth_mask[0] if getattr(c, "depth_mask", None) is not None else torch.ones_like(inv_r))
+    if not any_depth:
+        return
+    D_ref, REL = refine_depth_maps(cams, mono_z, tau=opt.cov_tau, max_dim=opt.cov_max_dim)
+    Xs, Cs = [], []
+    for i in range(len(cams)):
+        hole = ((render_z[i] - D_ref[i]) / D_ref[i].clamp_min(1e-6)).clamp(0.0, 10.0)   # render behind prior surface
+        xyz, rgb = generate_frgd_points(cams[i], imgs[i], D_ref[i], REL[i], grads[i], hole, base_mask=masks[i],
+                                        tex_thr=opt.frgd_tex_thr, hole_thr=opt.frgd_hole_thr,
+                                        rel_thr=opt.frgd_rel_thr, max_points=opt.frgd_max_per_step)
+        if xyz.shape[0] > 0:
+            Xs.append(xyz); Cs.append(rgb)
+    if not Xs:
+        print(f"[FRGD {iteration}] 0 candidates", flush=True); return
+    X = torch.cat(Xs, 0).cuda(); C = torch.cat(Cs, 0).cuda()
+    keep = _frgd_dedup(X, gaussians.get_xyz, opt.percent_dense * scene.cameras_extent)
+    X, C = X[keep], C[keep]
+    if X.shape[0] > opt.frgd_max_per_step:
+        idx = torch.randperm(X.shape[0], device=X.device)[:opt.frgd_max_per_step]; X, C = X[idx], C[idx]
+    n = gaussians.add_frgd_points(X, C)
+    print(f"[FRGD {iteration}] +{n} pts -> {gaussians.get_xyz.shape[0]} total", flush=True)
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
@@ -211,6 +264,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+
+                # VS-Depth v4 FRGD: depth-guided densification of under-reconstructed low-texture regions
+                if opt.densify_mode == "frgd" and iteration >= opt.frgd_start and iteration % opt.frgd_interval == 0:
+                    frgd_step(scene, gaussians, pipe, background, opt, SPARSE_ADAM_AVAILABLE,
+                              dataset.train_test_exp, iteration)
 
             # Optimizer step
             if iteration < opt.iterations:

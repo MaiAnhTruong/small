@@ -406,6 +406,32 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
+    def add_frgd_points(self, xyz, rgb):
+        """VS-Depth v4 (FRGD): insert NEW Gaussians at refined-depth positions (non-zero-sum densification),
+        reusing the standard densification_postfix so optimizer/Adam state stays consistent.
+        xyz [M,3] world positions; rgb [M,3] in [0,1]. Returns #points added."""
+        if xyz is None or xyz.shape[0] == 0:
+            return 0
+        xyz = xyz.float().cuda(); rgb = rgb.float().clamp(0.0, 1.0).cuda()
+        M = xyz.shape[0]
+        feat = torch.zeros((M, 3, (self.max_sh_degree + 1) ** 2), device="cuda")
+        feat[:, :3, 0] = RGB2SH(rgb)
+        new_features_dc = feat[:, :, 0:1].transpose(1, 2).contiguous()         # [M,1,3]
+        new_features_rest = feat[:, :, 1:].transpose(1, 2).contiguous()        # [M,rest,3]
+        if M >= 2:                                                            # local scale from k-NN (like init)
+            dist2 = torch.clamp_min(distCUDA2(xyz), 1e-7)
+            new_scaling = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+        else:
+            new_scaling = self._scaling.detach().median(dim=0).values[None].repeat(M, 1)
+        new_rotation = torch.zeros((M, 4), device="cuda"); new_rotation[:, 0] = 1
+        new_opacities = self.inverse_opacity_activation(0.1 * torch.ones((M, 1), dtype=torch.float, device="cuda"))
+        # densification_postfix cats self.tmp_radii -> ensure it has the current length first
+        self.tmp_radii = torch.zeros(self.get_xyz.shape[0], device="cuda")
+        self.densification_postfix(xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
+                                   new_rotation, torch.zeros(M, device="cuda"))
+        self.tmp_radii = None
+        return M
+
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
