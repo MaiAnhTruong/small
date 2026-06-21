@@ -70,18 +70,20 @@ def refine_depth_maps(cams, mono_depths_z, tau=0.05, max_dim=200):
 
 @torch.no_grad()
 def generate_frgd_points(cam, image, D_ref, rel, grad, hole, base_mask=None,
-                         tex_thr=0.05, hole_thr=0.5, rel_thr=0.5, max_points=20000):
+                         tex_thr=0.05, hole_thr=0.5, rel_thr=0.5, max_points=20000, return_rel=False):
     """Pick candidate pixels = under-reconstructed (hole>hole_thr) AND low-texture (grad<tex_thr, where 3DGS
     won't densify) AND reliable (rel>rel_thr), back-project via D_ref -> new 3D points + colors.
       image [3,H,W]; D_ref,rel,grad,hole [H,W]; hole = under-recon signal in [0,1] (e.g. 1-alpha or
-      normalized |render_depth - D_ref|). Returns xyz [M,3], rgb [M,3] (M<=max_points)."""
+      normalized |render_depth - D_ref|). Returns xyz [M,3], rgb [M,3] (M<=max_points).
+      return_rel (CGD v7): also return rel[M] at the kept pixels (= multi-view confidence -> opacity init)."""
     H, W = D_ref.shape
     cand = (grad < tex_thr) & (hole > hole_thr) & (rel > rel_thr) & (D_ref > 1e-6)
     if base_mask is not None:
         cand = cand & (base_mask > 0)
     idx = cand.reshape(-1).nonzero(as_tuple=False).squeeze(1)
     if idx.numel() == 0:
-        return image.new_zeros((0, 3)), image.new_zeros((0, 3))
+        z0 = image.new_zeros((0, 3))
+        return (z0, z0, image.new_zeros((0,))) if return_rel else (z0, z0)
     if idx.numel() > max_points:                                            # cap (avoid explosion)
         perm = torch.randperm(idx.numel(), device=idx.device)[:max_points]
         idx = idx[perm]
@@ -89,4 +91,6 @@ def generate_frgd_points(cam, image, D_ref, rel, grad, hole, base_mask=None,
     z = D_ref.reshape(-1)[idx]
     xyz = unproject_pixels(cam, uu, vv, z)
     rgb = image.reshape(3, -1)[:, idx].t()
+    if return_rel:
+        return xyz, rgb, rel.reshape(-1)[idx]
     return xyz, rgb

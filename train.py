@@ -17,7 +17,6 @@ from gaussian_renderer import render, network_gui
 from utils.covisibility import compute_gates, compute_fisher_gates, image_grad_mag
 from utils.frgd import refine_depth_maps, generate_frgd_points
 from utils.frgd_g import frgd_g_shape
-from utils.bdvr import compute_supp_weight
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
@@ -105,56 +104,46 @@ def frgd_step(scene, gaussians, pipe, background, opt, separate_sh, use_exp, ite
     if not any_depth:
         return
     mode = opt.densify_mode
+    shape_mode = mode in ("frgdg", "cgd")   # FRGD-G geometry-correct shape (frustum z/f anisotropic disk)
     if mode == "rawdensify":          # ABLATION: naive raw-mono densify (NO refine, NO reliability/texture gate)
         place = mono_z; REL = [torch.ones_like(m) for m in mono_z]; tex_thr = 1e9
-    else:                             # frgd / frgdg / bdvr: multi-view-REFINED depth + reliability + texture target
+    else:                             # frgd / frgdg / cgd: multi-view-REFINED depth + reliability + texture target
         place, REL = refine_depth_maps(cams, mono_z, tau=opt.cov_tau, max_dim=opt.cov_max_dim)
         tex_thr = opt.frgd_tex_thr
-    Xs, Cs, Ss, Qs = [], [], [], []
+    rel_thr = opt.cgd_rel_floor if mode == "cgd" else opt.frgd_rel_thr   # cgd: low floor, opacity does the rest
+    Xs, Cs, Ss, Qs, Os = [], [], [], [], []
     for i in range(len(cams)):
         hole = ((render_z[i] - place[i]) / place[i].clamp_min(1e-6)).clamp(0.0, 10.0)   # render behind prior surface
-        xyz, rgb = generate_frgd_points(cams[i], imgs[i], place[i], REL[i], grads[i], hole, base_mask=masks[i],
-                                        tex_thr=tex_thr, hole_thr=opt.frgd_hole_thr,
-                                        rel_thr=opt.frgd_rel_thr, max_points=opt.frgd_max_per_step)
-        if xyz.shape[0] > 0:
-            Xs.append(xyz); Cs.append(rgb)
-            if mode == "frgdg":       # FRGD-G: per-point geometry-correct shape (frustum z/f anisotropic disk)
-                sc, qu = frgd_g_shape(xyz, cams[i], c_f=opt.frgdg_cf, beta=opt.frgdg_beta,
-                                      sigma_max_frac=opt.frgdg_sigma_max_frac, extent=scene.cameras_extent)
-                Ss.append(sc); Qs.append(qu)
+        out = generate_frgd_points(cams[i], imgs[i], place[i], REL[i], grads[i], hole, base_mask=masks[i],
+                                   tex_thr=tex_thr, hole_thr=opt.frgd_hole_thr, rel_thr=rel_thr,
+                                   max_points=opt.frgd_max_per_step, return_rel=(mode == "cgd"))
+        xyz, rgb = (out[0], out[1])
+        if xyz.shape[0] == 0:
+            continue
+        Xs.append(xyz); Cs.append(rgb)
+        if shape_mode:
+            sc, qu = frgd_g_shape(xyz, cams[i], c_f=opt.frgdg_cf, beta=opt.frgdg_beta,
+                                  sigma_max_frac=opt.frgdg_sigma_max_frac, extent=scene.cameras_extent)
+            Ss.append(sc); Qs.append(qu)
+        if mode == "cgd":
+            Os.append((0.1 * out[2]).clamp(1e-4, 0.99))                  # o_init = 0.1 * conf (Eq 4.1)
     if not Xs:
         print(f"[{mode} {iteration}] 0 candidates", flush=True); return
     X = torch.cat(Xs, 0).cuda(); C = torch.cat(Cs, 0).cuda()
-    S = torch.cat(Ss, 0).cuda() if mode == "frgdg" else None
-    Q = torch.cat(Qs, 0).cuda() if mode == "frgdg" else None
+    S = torch.cat(Ss, 0).cuda() if shape_mode else None
+    Q = torch.cat(Qs, 0).cuda() if shape_mode else None
+    O = torch.cat(Os, 0).cuda() if mode == "cgd" else None
     keep = _frgd_dedup(X, gaussians.get_xyz, opt.percent_dense * scene.cameras_extent)
     X, C = X[keep], C[keep]
     if S is not None: S, Q = S[keep], Q[keep]
+    if O is not None: O = O[keep]
     if X.shape[0] > opt.frgd_max_per_step:
         idx = torch.randperm(X.shape[0], device=X.device)[:opt.frgd_max_per_step]
         X, C = X[idx], C[idx]
         if S is not None: S, Q = S[idx], Q[idx]
-    n = gaussians.add_frgd_points(X, C, scales=S, quats=Q)
+        if O is not None: O = O[idx]
+    n = gaussians.add_frgd_points(X, C, scales=S, quats=Q, opacities=O)
     print(f"[{mode} {iteration}] +{n} pts -> {gaussians.get_xyz.shape[0]} total", flush=True)
-
-
-@torch.no_grad()
-def recompute_supp_weight(scene, gaussians, pipe, background, opt, separate_sh, use_exp, anchors):
-    """BDVR (v5): render all train depths, compute per-Gaussian unsupportedness phi (utils.bdvr) and store it
-    as gaussians.supp_weight, used by the persistent suppression prior L_supp = supp_lambda*sum(phi*opacity).
-    phi rides through densify (new points=0=grace) / prune (masked) until the next recompute."""
-    cams = scene.getTrainCameras()
-    depths_z = []
-    for c in cams:
-        pkg = render(c, gaussians, pipe, background, use_trained_exp=use_exp, separate_sh=separate_sh)
-        depths_z.append(1.0 / pkg["depth"][0].clamp_min(1e-6))                  # rendered metric depth z
-    r_s = opt.supp_rs_scale * opt.percent_dense * scene.cameras_extent
-    phi = compute_supp_weight(gaussians.get_xyz.detach(), cams, depths_z, anchors,
-                              tau=opt.supp_tau, r_s=r_s, min_views=opt.supp_min_views)
-    gaussians.supp_weight = phi
-    n_fl = int((phi > 0.5).sum().item())
-    print(f"[bdvr-supp {len(cams)}v] flagged(phi>0.5)={n_fl}/{phi.shape[0]} "
-          f"mean_phi={float(phi.mean()):.4f} r_s={r_s:.3f}", flush=True)
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
@@ -170,9 +159,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
-
-    # BDVR: snapshot the initial (SfM) Gaussian positions as fixed reliable surface anchors for suppression.
-    bdvr_anchors = gaussians.get_xyz.detach().clone() if opt.densify_mode == "bdvr" else None
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -269,16 +255,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
-        # BDVR (v5) suppression prior: persistent geometric opacity prior on unsupported Gaussians (floaters).
-        # Added to the objective for backward only (kept OUT of the displayed ema loss). Per-flagged-point it
-        # applies a constant downward force on opacity that competes with the photometric pull (-> floaters
-        # pruned, genuine points restored). supp_weight is 0 before the first recompute / for grace points.
-        total_loss = loss
-        if opt.densify_mode == "bdvr" and iteration >= opt.supp_start \
-           and gaussians.supp_weight.shape[0] == gaussians.get_xyz.shape[0]:
-            total_loss = loss + opt.supp_lambda * (gaussians.supp_weight * gaussians.get_opacity.squeeze(1)).sum()
-
-        total_loss.backward()
+        loss.backward()
 
         iter_end.record()
 
@@ -312,18 +289,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
-                # VS-Depth v4 FRGD: depth-guided densification (frgd=refined+targeted; rawdensify=naive ablation;
-                # bdvr=refined add; frgdg=refined add + geometry-correct shape init). The ADD side.
-                if opt.densify_mode in ("frgd", "rawdensify", "bdvr", "frgdg") and iteration >= opt.frgd_start and iteration % opt.frgd_interval == 0:
+                # VS-Depth depth-guided densification (rawdensify=naive; frgd=refined+targeted;
+                # frgdg=+geometry-correct shape; cgd=+confidence-opacity). The ADD side.
+                if opt.densify_mode in ("frgd", "rawdensify", "frgdg", "cgd") and iteration >= opt.frgd_start and iteration % opt.frgd_interval == 0:
                     frgd_step(scene, gaussians, pipe, background, opt, SPARSE_ADAM_AVAILABLE,
                               dataset.train_test_exp, iteration)
-
-                # VS-Depth v5 BDVR: recompute per-Gaussian unsupportedness phi (the REMOVE side). Renders all
-                # train depths; sets gaussians.supp_weight used by L_supp above.
-                if opt.densify_mode == "bdvr" and iteration >= opt.supp_start and \
-                   (iteration == opt.supp_start or iteration % opt.supp_interval == 0):
-                    recompute_supp_weight(scene, gaussians, pipe, background, opt, SPARSE_ADAM_AVAILABLE,
-                                          dataset.train_test_exp, bdvr_anchors)
 
             # Optimizer step
             if iteration < opt.iterations:

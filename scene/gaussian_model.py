@@ -60,7 +60,6 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
-        self.supp_weight = torch.empty(0)        # BDVR (v5): per-Gaussian unsupportedness phi (floater prior)
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -180,7 +179,6 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.supp_weight = torch.zeros((self.get_xyz.shape[0]), device="cuda")    # BDVR floater prior phi
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -364,8 +362,6 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
-        if self.supp_weight.shape[0] == valid_points_mask.shape[0]:               # BDVR: keep phi in sync
-            self.supp_weight = self.supp_weight[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -409,21 +405,16 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        # BDVR: extend supp_weight with zeros for the NEW points (grace = newly added/cloned/split points are
-        # exempt from suppression until the next phi recompute). Surviving points keep their phi.
-        new_n = new_xyz.shape[0]
-        if self.supp_weight.shape[0] == self.get_xyz.shape[0] - new_n:
-            self.supp_weight = torch.cat((self.supp_weight, torch.zeros(new_n, device="cuda")))
-        else:
-            self.supp_weight = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def add_frgd_points(self, xyz, rgb, scales=None, quats=None):
+    def add_frgd_points(self, xyz, rgb, scales=None, quats=None, opacities=None):
         """VS-Depth v4 (FRGD): insert NEW Gaussians at refined-depth positions (non-zero-sum densification),
         reusing the standard densification_postfix so optimizer/Adam state stays consistent.
         xyz [M,3] world positions; rgb [M,3] in [0,1].
         FRGD-G (v6): if scales [M,3] (world std, axes=[tangent,tangent,ray]) and quats [M,4] (w,x,y,z) are
         given, initialize the Gaussian geometry from them (frustum footprint + camera-facing disk) instead of
-        the isotropic distCUDA2 kNN blob. Opacity is UNCHANGED either way. Returns #points added."""
+        the isotropic distCUDA2 kNN blob.
+        CGD (v7): if opacities [M] in (0,1) is given, use it as the initial opacity (= 0.1*conf) instead of the
+        constant 0.1 -> depth-uncertain points born faint -> self-prune. Returns #points added."""
         if xyz is None or xyz.shape[0] == 0:
             return 0
         xyz = xyz.float().cuda(); rgb = rgb.float().clamp(0.0, 1.0).cuda()
@@ -443,7 +434,10 @@ class GaussianModel:
             new_rotation = torch.nn.functional.normalize(quats.float().cuda(), dim=1)
         else:
             new_rotation = torch.zeros((M, 4), device="cuda"); new_rotation[:, 0] = 1
-        new_opacities = self.inverse_opacity_activation(0.1 * torch.ones((M, 1), dtype=torch.float, device="cuda"))
+        if opacities is not None:                                            # CGD: confidence-scaled init opacity
+            new_opacities = self.inverse_opacity_activation(opacities.float().cuda().clamp(1e-4, 1 - 1e-4).view(-1, 1))
+        else:
+            new_opacities = self.inverse_opacity_activation(0.1 * torch.ones((M, 1), dtype=torch.float, device="cuda"))
         # densification_postfix cats self.tmp_radii -> ensure it has the current length first
         self.tmp_radii = torch.zeros(self.get_xyz.shape[0], device="cuda")
         self.densification_postfix(xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,

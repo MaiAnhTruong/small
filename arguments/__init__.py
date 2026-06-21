@@ -117,12 +117,15 @@ class OptimizationParams(ParamGroup):
         # ---- VS-Depth v4: FRGD (Fisher-Reliability-Guided Densification) ----
         # densify depth into PLACEMENT (non-zero-sum) instead of LOSS (zero-sum, measured dead). Seeds new
         # Gaussians at multi-view-refined depth in under-reconstructed + low-texture + reliable regions.
-        # densify_mode: none -> base 3DGS densify only (bit-identical baseline); frgd -> + FRGD (refined depth
-        # + reliability + texture targeting); rawdensify -> ABLATION (naive raw-mono densify, no refine/gate)
-        # to isolate whether the refinement+targeting (novelty) matters vs plain depth densification;
-        # bdvr -> FRGD add + BDVR suppression (v5): the newest method = bidirectional add(holes)+remove(floaters).
-        # frgdg -> FRGD-G (v6): FRGD placement + geometry-correct SHAPE init (frustum z/f anisotropic disk,
-        #          camera-facing), opacity/placement unchanged. The newest method (DESIGN_AND_PROOF_v6, proofs 13/13).
+        # densify_mode (ablation ladder, all on top of base 3DGS densify):
+        #   none       -> base 3DGS densify only (bit-identical baseline)
+        #   rawdensify -> naive raw-mono depth densify (no refine / no reliability / no texture gate)
+        #   frgd       -> FRGD (v4): multi-view-REFINED depth placement + reliability filter + texture targeting
+        #   frgdg      -> FRGD-G (v6): frgd placement + geometry-correct SHAPE init (frustum z/f anisotropic disk,
+        #                 camera-facing); opacity unchanged (proofs test_frgd_g 13/13)
+        #   cgd        -> CGD (v7, NEWEST): frgdg + Confidence-guided OPACITY init  o_init = 0.1 * conf, where
+        #                 conf = multi-view fusion reliability (rel). Depth-uncertain points are born faint and
+        #                 self-prune unless photometric evidence rescues them (proofs test_cgd 11/11).
         # Typically run WITH gate_mode=uniform (-d depths): uniform depth loss (proven) + densification.
         self.densify_mode = "none"
         self.frgd_start = 2000         # begin FRGD after geometry roughly forms
@@ -131,20 +134,12 @@ class OptimizationParams(ParamGroup):
         self.frgd_tex_thr = 0.02       # low-texture: |grad I| below this (where 3DGS densify fails)
         self.frgd_hole_thr = 0.15      # under-recon: (render_z - D_ref)/D_ref above this = hole behind prior surface
         self.frgd_rel_thr = 0.5        # reliability: multi-view agreement of D_ref above this = trust placement
-        # ---- VS-Depth v5: BDVR suppression (persistent geometric opacity prior on floaters) ----
-        # Active only when densify_mode == "bdvr". L_supp = supp_lambda * sum_i phi_i * opacity_i, phi from
-        # utils/bdvr.py = (1-GS)*OCC unsupportedness. Removes multi-view-inconsistent floaters that 3DGS's own
-        # opacity-prune keeps; reversible (photometric pull restores false positives). See DESIGN_AND_PROOF_v5.
-        self.supp_lambda = 0.01        # weight of the suppression prior (per-flagged-point opacity force)
-        self.supp_start = 2000         # begin suppression after geometry forms (same as FRGD)
-        self.supp_interval = 500       # recompute phi every N iters (renders all train depths)
-        self.supp_tau = 0.05           # front-violation tolerance: in front of consensus by > tau -> floater vote
-        self.supp_rs_scale = 4.0       # anchor shell radius r_s = supp_rs_scale * percent_dense * extent
-        self.supp_min_views = 2        # need >= this many in-frame views to judge OCC (else phi=0)
-        # ---- VS-Depth v6: FRGD-G geometry-correct densification init (active when densify_mode=="frgdg") ----
+        # ---- VS-Depth v6/v7: FRGD-G shape init + CGD confidence-opacity (active for densify_mode frgdg/cgd) ----
         self.frgdg_cf = 1.0            # lateral world std = frgdg_cf * z / f  (pixel-frustum footprint, Eq 2.1)
         self.frgdg_beta = 0.25         # along-ray std = frgdg_beta * lateral std (flattened disk, Eq 3.1)
         self.frgdg_sigma_max_frac = 0.1 # clamp lateral std <= frgdg_sigma_max_frac * cameras_extent (safety)
+        self.cgd_rel_floor = 0.1       # cgd: keep candidates with rel>this (graded opacity does the rest), then
+                                       #      o_init = 0.1 * rel  -> low-rel points faint -> self-prune (Eq 4.1/5.1)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
