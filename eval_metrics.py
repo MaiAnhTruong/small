@@ -45,7 +45,7 @@ def geom_consistency(cams, depths_z, max_dim=128):
             Wj, Hj = int(low_c[j].image_width), int(low_c[j].image_height)
             infr = (u >= 0) & (u < Wj) & (v >= 0) & (v < Hj) & (zX > 1e-6)
             zj = _sample(low_d[j], u.clamp(0, Wj - 1), v.clamp(0, Hj - 1), Wj, Hj)
-            r = (zX - zj).abs() / zi
+            r = ((zX - zj).abs() / zi).clamp(max=1.0)        # cap: >100% rel-err = non-covisible/floater (robust)
             acc += torch.where(infr, r, torch.zeros_like(r)); cnt += infr.float()
         m = cnt > 0
         if m.any():
