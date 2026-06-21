@@ -14,8 +14,8 @@ import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
-from utils.covisibility import compute_gates, compute_fisher_gates, image_grad_mag
-from utils.frgd import refine_depth_maps, generate_frgd_points
+from utils.covisibility import image_grad_mag
+from utils.frgd import refine_depth_maps, generate_frgd_points, unproject_pixels
 from utils.frgd_g import frgd_g_shape
 import sys
 from scene import Scene, GaussianModel
@@ -42,34 +42,6 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
-
-@torch.no_grad()
-def recompute_vsdepth_gates(scene, gaussians, pipe, background, opt, separate_sh, use_exp):
-    """VS-Depth: render all TRAIN-view depths, compute the covisibility gate per camera, store cam.vsdepth_gate.
-    Periodic (every opt.cov_interval). Gate replaces the uniform depth_mask in the depth loss."""
-    cams = scene.getTrainCameras()
-    depths_z, invds, masks = [], [], []
-    for c in cams:
-        pkg = render(c, gaussians, pipe, background, use_trained_exp=use_exp, separate_sh=separate_sh)
-        invd = pkg["depth"][0]                                  # [H,W] rendered INVERSE depth
-        depths_z.append(1.0 / invd.clamp_min(1e-6))             # -> metric depth z for covisibility
-        invds.append(c.invdepthmap[0] if c.invdepthmap is not None else None)
-        masks.append(c.depth_mask[0] if getattr(c, "depth_mask", None) is not None else torch.ones_like(invd))
-    if opt.gate_mode == "fisher":
-        grads = []
-        for c in cams:
-            if not hasattr(c, "_vsd_grad"):                     # |grad I| cached (image is fixed)
-                c._vsd_grad = image_grad_mag(c.original_image.cuda())
-            grads.append(c._vsd_grad)
-        gates = compute_fisher_gates(cams, depths_z, grads, invds, masks,
-                                     c=opt.fisher_c, tau=opt.cov_tau, max_dim=opt.cov_max_dim, cap=opt.fisher_cap)
-    else:
-        gates = compute_gates(cams, depths_z, invds, masks, opt.gate_mode,
-                              tau=opt.cov_tau, gamma=opt.gate_gamma, rel_sigma=opt.gate_rel_sigma,
-                              max_dim=opt.cov_max_dim)
-    for c, g in zip(cams, gates):
-        c.vsdepth_gate = g.detach()[None]                       # [1,H,W]
-
 
 def _frgd_dedup(X, existing, voxel):
     """Drop new points whose voxel already contains an existing Gaussian (avoid redundant overlap)."""
@@ -146,6 +118,54 @@ def frgd_step(scene, gaussians, pipe, background, opt, separate_sh, use_exp, ite
     print(f"[{mode} {iteration}] +{n} pts -> {gaussians.get_xyz.shape[0]} total", flush=True)
 
 
+@torch.no_grad()
+def digs_init(scene, gaussians, opt):
+    """VS-Depth v8 DIGS: dense depth-backprojected INITIALIZATION at iter 0 (DESIGN_AND_PROOF_v8, proofs 9/9).
+    Back-project the multi-view-refined aligned depth of all train views (subsampled, reliability>floor) as
+    geometry-correct surfels (frustum z/f disk, FRGD-G) and ADD them to the SfM cloud BEFORE training, so they
+    receive the full optimization budget (init-persistence) instead of the partial budget of mid-training FRGD."""
+    cams = scene.getTrainCameras()
+    mono_z, vcams = [], []
+    for c in cams:
+        if c.invdepthmap is not None and c.depth_reliable:
+            mono_z.append(1.0 / c.invdepthmap[0].clamp_min(1e-6)); vcams.append(c)
+    if not mono_z:
+        print("[digs] no reliable depth -> skip dense init", flush=True); return
+    D_ref, REL = refine_depth_maps(vcams, mono_z, tau=opt.cov_tau, max_dim=opt.cov_max_dim)
+    s = max(1, int(opt.digs_stride))
+    Xs, Cs, Ss, Qs, Os = [], [], [], [], []
+    for i, c in enumerate(vcams):
+        H, W = D_ref[i].shape
+        vv, uu = torch.meshgrid(torch.arange(0, H, s, device=D_ref[i].device),
+                                torch.arange(0, W, s, device=D_ref[i].device), indexing="ij")
+        vv, uu = vv.reshape(-1), uu.reshape(-1)
+        z = D_ref[i][vv, uu]; rel = REL[i][vv, uu]
+        keep = (rel > opt.digs_rel_floor) & (z > 1e-6)
+        if keep.sum() == 0:
+            continue
+        vv, uu, z, rel = vv[keep], uu[keep], z[keep], rel[keep]
+        xyz = unproject_pixels(c, uu.float(), vv.float(), z)
+        rgb = c.original_image.cuda()[:, vv, uu].t()                          # color at the back-projected pixels
+        sc, qu = frgd_g_shape(xyz, c, c_f=opt.frgdg_cf, beta=opt.frgdg_beta,
+                              sigma_max_frac=opt.frgdg_sigma_max_frac, extent=scene.cameras_extent)
+        Xs.append(xyz); Cs.append(rgb); Ss.append(sc); Qs.append(qu)
+        if opt.digs_conf_opacity:
+            Os.append((0.1 * rel).clamp(1e-4, 0.99))                          # CGD-style (optional); default 0.1
+    if not Xs:
+        print("[digs] 0 candidates -> skip dense init", flush=True); return
+    X = torch.cat(Xs).cuda(); C = torch.cat(Cs).cuda(); S = torch.cat(Ss).cuda(); Q = torch.cat(Qs).cuda()
+    O = torch.cat(Os).cuda() if opt.digs_conf_opacity else None
+    keep = _frgd_dedup(X, gaussians.get_xyz, opt.percent_dense * scene.cameras_extent)   # drop overlap with SfM
+    X, C, S, Q = X[keep], C[keep], S[keep], Q[keep]
+    if O is not None: O = O[keep]
+    if X.shape[0] > opt.digs_max_points:
+        idx = torch.randperm(X.shape[0], device=X.device)[:opt.digs_max_points]
+        X, C, S, Q = X[idx], C[idx], S[idx], Q[idx]
+        if O is not None: O = O[idx]
+    n = gaussians.add_frgd_points(X, C, scales=S, quats=Q, opacities=O)
+    print(f"[digs] dense depth init: +{n} pts -> {gaussians.get_xyz.shape[0]} total", flush=True)
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -159,6 +179,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    if opt.init_mode == "depth" and not checkpoint:        # DIGS: dense depth init at iter 0 (v8)
+        digs_init(scene, gaussians, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -200,12 +223,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # VS-Depth: (re)compute covisibility/Fisher gates from current geometry, periodically
-        if opt.gate_mode in ("covonly", "gated", "fisher") and iteration >= opt.cov_start and \
-           (iteration == opt.cov_start or iteration % opt.cov_interval == 0):
-            recompute_vsdepth_gates(scene, gaussians, pipe, background, opt,
-                                    SPARSE_ADAM_AVAILABLE, dataset.train_test_exp)
-
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
@@ -237,17 +254,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-        # Depth regularization (VS-Depth: gate_mode selects the per-pixel weight map)
+        # Depth regularization (uniform 3DGS depth loss; gate_mode none disables it)
         Ll1depth_pure = 0.0
         if opt.gate_mode != "none" and depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
             invDepth = render_pkg["depth"]
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-            # covonly/gated/fisher: use the gate once computed; else (uniform / pre-cov_start) depth_mask
-            if opt.gate_mode in ("covonly", "gated", "fisher") and getattr(viewpoint_cam, "vsdepth_gate", None) is not None:
-                depth_w = viewpoint_cam.vsdepth_gate.cuda()
-            else:
-                depth_w = viewpoint_cam.depth_mask.cuda()
-
+            depth_w = viewpoint_cam.depth_mask.cuda()
             Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_w).mean()
             Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure
             loss += Ll1depth

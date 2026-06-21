@@ -5,7 +5,7 @@ PNGs that the 3DGS depth pipeline expects. Then run utils/make_depth_scale.py to
 Usage (per scene, TRAIN split only):
   python prepare_depth.py --images_dir <scene>/train/images --out_dir <scene>/train/depths
   python utils/make_depth_scale.py --base_dir <scene>/train --depths_dir <scene>/train/depths --model_type bin
-  # then train with:  -d depths   (and --gate_mode gated)
+  # then train with:  -d depths   (and --gate_mode uniform)
 """
 import os
 import argparse

@@ -97,23 +97,12 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
-        # ---- VS-Depth: covisibility-gated depth supervision (our contribution) ----
-        # gate_mode replaces the UNIFORM depth_mask in the depth loss with a per-pixel gate w = g_cov*rel.
-        #   none    : no depth supervision (= vanilla 3DGS, ablation baseline (i))
-        #   uniform : original 3DGS depth loss, depth_mask=ones (ablation (ii), ~FSGS/global depth)
-        #   covonly : g_cov(cov) only (ablation (iii), ~CoMapGS covisibility gate)
-        #   gated   : g_cov(cov)*rel (ours v1, (iv)) -- MSE-optimal allocation (proven, test_vsdepth_theory.py)
-        #   fisher  : weight = a*(H,delta), H = photometric FISHER info (v2, proven test_fisher_gate.py 8/8).
-        #             Fixes CoMapGS limitation: count drops texture |grad I|^2 + geometry -> wrong proxy of H.
+        # ---- VS-Depth: depth supervision mode ----
+        #   none    : no depth supervision (= vanilla 3DGS)
+        #   uniform : 3DGS depth loss with depth_mask (the proven setting; used with FRGD/DIGS densification)
         self.gate_mode = "uniform"
-        self.cov_start = 2000          # begin gating after geometry roughly forms (depth meaningful)
-        self.cov_interval = 1000       # recompute covisibility/gate every N iters (renders all train depths)
-        self.cov_tau = 0.05            # depth tolerance for the occlusion check
-        self.cov_max_dim = 200         # covisibility/Fisher computed at this max image dim (smooth -> downsampled)
-        self.gate_gamma = 1.0          # g_cov = 1/(1+cov)^gamma : sharpness of covisibility down-weighting
-        self.gate_rel_sigma = 0.10     # reliability = exp(-|grad(mono_invdepth)|/sigma) : edge down-weight
-        self.fisher_c = 0.5            # fisher: a* threshold c (mean-normalized H,delta); higher -> more max-weight
-        self.fisher_cap = 8.0          # fisher: max per-pixel depth weight (clamp on a*)
+        self.cov_tau = 0.05            # depth tolerance for multi-view fusion (refine_depth_maps)
+        self.cov_max_dim = 200         # multi-view fusion computed at this max image dim (smooth -> downsampled)
         # ---- VS-Depth v4: FRGD (Fisher-Reliability-Guided Densification) ----
         # densify depth into PLACEMENT (non-zero-sum) instead of LOSS (zero-sum, measured dead). Seeds new
         # Gaussians at multi-view-refined depth in under-reconstructed + low-texture + reliable regions.
@@ -140,6 +129,14 @@ class OptimizationParams(ParamGroup):
         self.frgdg_sigma_max_frac = 0.1 # clamp lateral std <= frgdg_sigma_max_frac * cameras_extent (safety)
         self.cgd_rel_floor = 0.1       # cgd: keep candidates with rel>this (graded opacity does the rest), then
                                        #      o_init = 0.1 * rel  -> low-rel points faint -> self-prune (Eq 4.1/5.1)
+        # ---- VS-Depth v8: DIGS dense depth-backprojected INITIALIZATION (init_mode="depth") ----
+        # Inject the depth capacity at iter 0 (dense, geometry-correct surfels) instead of mid-training, so it
+        # gets full optimization budget (init-persistence). See DESIGN_AND_PROOF_v8 (proofs test_digs 9/9).
+        self.init_mode = "sfm"         # "sfm" (base: SfM-only init) | "depth" (DIGS: + dense depth init at iter 0)
+        self.digs_stride = 4           # pixel subsample stride for back-projection (controls init density)
+        self.digs_rel_floor = 0.3      # keep back-projected pixels with multi-view reliability rel > this
+        self.digs_max_points = 1500000 # cap total dense-init points (after dedup vs SfM)
+        self.digs_conf_opacity = False # True: o_init=0.1*rel (CGD-style); default constant 0.1 (robust)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
