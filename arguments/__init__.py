@@ -121,6 +121,8 @@ class OptimizationParams(ParamGroup):
         # + reliability + texture targeting); rawdensify -> ABLATION (naive raw-mono densify, no refine/gate)
         # to isolate whether the refinement+targeting (novelty) matters vs plain depth densification;
         # bdvr -> FRGD add + BDVR suppression (v5): the newest method = bidirectional add(holes)+remove(floaters).
+        # frgdg -> FRGD-G (v6): FRGD placement + geometry-correct SHAPE init (frustum z/f anisotropic disk,
+        #          camera-facing), opacity/placement unchanged. The newest method (DESIGN_AND_PROOF_v6, proofs 13/13).
         # Typically run WITH gate_mode=uniform (-d depths): uniform depth loss (proven) + densification.
         self.densify_mode = "none"
         self.frgd_start = 2000         # begin FRGD after geometry roughly forms
@@ -139,6 +141,10 @@ class OptimizationParams(ParamGroup):
         self.supp_tau = 0.05           # front-violation tolerance: in front of consensus by > tau -> floater vote
         self.supp_rs_scale = 4.0       # anchor shell radius r_s = supp_rs_scale * percent_dense * extent
         self.supp_min_views = 2        # need >= this many in-frame views to judge OCC (else phi=0)
+        # ---- VS-Depth v6: FRGD-G geometry-correct densification init (active when densify_mode=="frgdg") ----
+        self.frgdg_cf = 1.0            # lateral world std = frgdg_cf * z / f  (pixel-frustum footprint, Eq 2.1)
+        self.frgdg_beta = 0.25         # along-ray std = frgdg_beta * lateral std (flattened disk, Eq 3.1)
+        self.frgdg_sigma_max_frac = 0.1 # clamp lateral std <= frgdg_sigma_max_frac * cameras_extent (safety)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

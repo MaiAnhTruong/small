@@ -417,10 +417,13 @@ class GaussianModel:
         else:
             self.supp_weight = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def add_frgd_points(self, xyz, rgb):
+    def add_frgd_points(self, xyz, rgb, scales=None, quats=None):
         """VS-Depth v4 (FRGD): insert NEW Gaussians at refined-depth positions (non-zero-sum densification),
         reusing the standard densification_postfix so optimizer/Adam state stays consistent.
-        xyz [M,3] world positions; rgb [M,3] in [0,1]. Returns #points added."""
+        xyz [M,3] world positions; rgb [M,3] in [0,1].
+        FRGD-G (v6): if scales [M,3] (world std, axes=[tangent,tangent,ray]) and quats [M,4] (w,x,y,z) are
+        given, initialize the Gaussian geometry from them (frustum footprint + camera-facing disk) instead of
+        the isotropic distCUDA2 kNN blob. Opacity is UNCHANGED either way. Returns #points added."""
         if xyz is None or xyz.shape[0] == 0:
             return 0
         xyz = xyz.float().cuda(); rgb = rgb.float().clamp(0.0, 1.0).cuda()
@@ -429,12 +432,17 @@ class GaussianModel:
         feat[:, :3, 0] = RGB2SH(rgb)
         new_features_dc = feat[:, :, 0:1].transpose(1, 2).contiguous()         # [M,1,3]
         new_features_rest = feat[:, :, 1:].transpose(1, 2).contiguous()        # [M,rest,3]
-        if M >= 2:                                                            # local scale from k-NN (like init)
+        if scales is not None:                                                # FRGD-G: geometry-correct init
+            new_scaling = torch.log(scales.float().cuda().clamp_min(1e-7))     # [M,3] anisotropic
+        elif M >= 2:                                                          # local scale from k-NN (like init)
             dist2 = torch.clamp_min(distCUDA2(xyz), 1e-7)
             new_scaling = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
         else:
             new_scaling = self._scaling.detach().median(dim=0).values[None].repeat(M, 1)
-        new_rotation = torch.zeros((M, 4), device="cuda"); new_rotation[:, 0] = 1
+        if quats is not None:                                                 # FRGD-G: oriented disk
+            new_rotation = torch.nn.functional.normalize(quats.float().cuda(), dim=1)
+        else:
+            new_rotation = torch.zeros((M, 4), device="cuda"); new_rotation[:, 0] = 1
         new_opacities = self.inverse_opacity_activation(0.1 * torch.ones((M, 1), dtype=torch.float, device="cuda"))
         # densification_postfix cats self.tmp_radii -> ensure it has the current length first
         self.tmp_radii = torch.zeros(self.get_xyz.shape[0], device="cuda")

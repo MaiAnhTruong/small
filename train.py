@@ -16,6 +16,7 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 from utils.covisibility import compute_gates, compute_fisher_gates, image_grad_mag
 from utils.frgd import refine_depth_maps, generate_frgd_points
+from utils.frgd_g import frgd_g_shape
 from utils.bdvr import compute_supp_weight
 import sys
 from scene import Scene, GaussianModel
@@ -106,10 +107,10 @@ def frgd_step(scene, gaussians, pipe, background, opt, separate_sh, use_exp, ite
     mode = opt.densify_mode
     if mode == "rawdensify":          # ABLATION: naive raw-mono densify (NO refine, NO reliability/texture gate)
         place = mono_z; REL = [torch.ones_like(m) for m in mono_z]; tex_thr = 1e9
-    else:                             # frgd (ours): multi-view-REFINED depth + reliability + texture targeting
+    else:                             # frgd / frgdg / bdvr: multi-view-REFINED depth + reliability + texture target
         place, REL = refine_depth_maps(cams, mono_z, tau=opt.cov_tau, max_dim=opt.cov_max_dim)
         tex_thr = opt.frgd_tex_thr
-    Xs, Cs = [], []
+    Xs, Cs, Ss, Qs = [], [], [], []
     for i in range(len(cams)):
         hole = ((render_z[i] - place[i]) / place[i].clamp_min(1e-6)).clamp(0.0, 10.0)   # render behind prior surface
         xyz, rgb = generate_frgd_points(cams[i], imgs[i], place[i], REL[i], grads[i], hole, base_mask=masks[i],
@@ -117,14 +118,23 @@ def frgd_step(scene, gaussians, pipe, background, opt, separate_sh, use_exp, ite
                                         rel_thr=opt.frgd_rel_thr, max_points=opt.frgd_max_per_step)
         if xyz.shape[0] > 0:
             Xs.append(xyz); Cs.append(rgb)
+            if mode == "frgdg":       # FRGD-G: per-point geometry-correct shape (frustum z/f anisotropic disk)
+                sc, qu = frgd_g_shape(xyz, cams[i], c_f=opt.frgdg_cf, beta=opt.frgdg_beta,
+                                      sigma_max_frac=opt.frgdg_sigma_max_frac, extent=scene.cameras_extent)
+                Ss.append(sc); Qs.append(qu)
     if not Xs:
         print(f"[{mode} {iteration}] 0 candidates", flush=True); return
     X = torch.cat(Xs, 0).cuda(); C = torch.cat(Cs, 0).cuda()
+    S = torch.cat(Ss, 0).cuda() if mode == "frgdg" else None
+    Q = torch.cat(Qs, 0).cuda() if mode == "frgdg" else None
     keep = _frgd_dedup(X, gaussians.get_xyz, opt.percent_dense * scene.cameras_extent)
     X, C = X[keep], C[keep]
+    if S is not None: S, Q = S[keep], Q[keep]
     if X.shape[0] > opt.frgd_max_per_step:
-        idx = torch.randperm(X.shape[0], device=X.device)[:opt.frgd_max_per_step]; X, C = X[idx], C[idx]
-    n = gaussians.add_frgd_points(X, C)
+        idx = torch.randperm(X.shape[0], device=X.device)[:opt.frgd_max_per_step]
+        X, C = X[idx], C[idx]
+        if S is not None: S, Q = S[idx], Q[idx]
+    n = gaussians.add_frgd_points(X, C, scales=S, quats=Q)
     print(f"[{mode} {iteration}] +{n} pts -> {gaussians.get_xyz.shape[0]} total", flush=True)
 
 
@@ -303,8 +313,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.reset_opacity()
 
                 # VS-Depth v4 FRGD: depth-guided densification (frgd=refined+targeted; rawdensify=naive ablation;
-                # bdvr=refined add, same as frgd). The ADD side of BDVR.
-                if opt.densify_mode in ("frgd", "rawdensify", "bdvr") and iteration >= opt.frgd_start and iteration % opt.frgd_interval == 0:
+                # bdvr=refined add; frgdg=refined add + geometry-correct shape init). The ADD side.
+                if opt.densify_mode in ("frgd", "rawdensify", "bdvr", "frgdg") and iteration >= opt.frgd_start and iteration % opt.frgd_interval == 0:
                     frgd_step(scene, gaussians, pipe, background, opt, SPARSE_ADAM_AVAILABLE,
                               dataset.train_test_exp, iteration)
 
